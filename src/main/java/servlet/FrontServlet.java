@@ -2,50 +2,30 @@ package servlet;
 
 import jakarta.servlet.*;
 import jakarta.servlet.http.*;
-import java.io.IOException;
 import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 
+import servlet.annotations.Controller;
 import servlet.annotations.Url;
 
 public class FrontServlet extends HttpServlet {
 
-    // Stockage des URLs detectees : url -> "ClassName#methodName"
+    // Stockage : url -> "ClassName#methodName"
     private HashMap<String, String> urlMappings = new HashMap<>();
 
-    // init est execute une seule fois au lancement de ce servlet
     @Override
     public void init() throws ServletException {
         try {
-            // Lire le package des controleurs depuis les init-params
-            String controllerPackage = this.getInitParameter("controller-package");
-            if (controllerPackage != null && !controllerPackage.isEmpty()) {
-                scanControllers(controllerPackage);
-            }
-        } catch (Exception e) {
-            throw new ServletException(e);
-        }
-    }
+            // Scanner tout le classpath pour trouver les @Controller
+            List<Class<?>> controllers = scanControllers();
 
-    // Scanner un package pour trouver les methodes annotees avec @Url
-    private void scanControllers(String packageName) throws Exception {
-        String path = packageName.replace('.', '/');
-        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-
-        java.util.Enumeration<URL> resources = classLoader.getResources(path);
-        List<File> dirs = new ArrayList<>();
-        while (resources.hasMoreElements()) {
-            URL resource = resources.nextElement();
-            dirs.add(new File(resource.toURI()));
-        }
-
-        for (File directory : dirs) {
-            List<Class<?>> classes = findClasses(directory, packageName);
-            for (Class<?> clazz : classes) {
+            // Pour chaque @Controller, chercher les methodes @Url
+            for (Class<?> clazz : controllers) {
                 for (Method method : clazz.getDeclaredMethods()) {
                     if (method.isAnnotationPresent(Url.class)) {
                         Url urlAnnotation = method.getAnnotation(Url.class);
@@ -55,24 +35,56 @@ public class FrontServlet extends HttpServlet {
                     }
                 }
             }
+
+        } catch (Exception e) {
+            throw new ServletException(e);
         }
     }
 
-    // Trouver recursivement toutes les classes dans un repertoire
-    private List<Class<?>> findClasses(File directory, String packageName) throws ClassNotFoundException {
-        List<Class<?>> classes = new ArrayList<>();
-        if (!directory.exists()) {
-            return classes;
+    // Scanner tout le classpath pour trouver les classes annotees @Controller
+    private List<Class<?>> scanControllers() throws Exception {
+        List<Class<?>> controllers = new ArrayList<>();
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+
+        // Parcourir toutes les racines du classpath
+        java.util.Enumeration<URL> roots = classLoader.getResources("");
+        while (roots.hasMoreElements()) {
+            URL root = roots.nextElement();
+            if (root.getProtocol().equals("file")) {
+                File rootDir = new File(root.toURI());
+                List<Class<?>> classes = findClasses(rootDir, rootDir);
+                for (Class<?> clazz : classes) {
+                    if (clazz.isAnnotationPresent(Controller.class)) {
+                        controllers.add(clazz);
+                    }
+                }
+            }
         }
-        File[] files = directory.listFiles();
+        return controllers;
+    }
+
+    // Trouver recursivement toutes les classes dans un repertoire
+    private List<Class<?>> findClasses(File root, File current) {
+        List<Class<?>> classes = new ArrayList<>();
+        if (!current.exists()) return classes;
+        File[] files = current.listFiles();
         if (files == null) return classes;
 
         for (File file : files) {
             if (file.isDirectory()) {
-                classes.addAll(findClasses(file, packageName + "." + file.getName()));
+                classes.addAll(findClasses(root, file));
             } else if (file.getName().endsWith(".class")) {
-                String className = packageName + '.' + file.getName().substring(0, file.getName().length() - 6);
-                classes.add(Class.forName(className));
+                String relativePath = root.toURI().relativize(file.toURI()).getPath();
+                String className = relativePath
+                        .replace("/", ".")
+                        .replace("\\", ".");
+                className = className.substring(0, className.length() - 6);
+                try {
+                    Class<?> clazz = Class.forName(className);
+                    classes.add(clazz);
+                } catch (ClassNotFoundException | NoClassDefFoundError e) {
+                    // Ignorer les classes non chargeables
+                }
             }
         }
         return classes;
@@ -99,14 +111,12 @@ public class FrontServlet extends HttpServlet {
             }
         }
 
-        // Sinon -> logique applicative
         // Extraire l'URL relative (sans le context path)
         String contextPath = req.getContextPath();
         String url = path.substring(contextPath.length());
 
         resp.setContentType("text/plain");
 
-        // Verifier si l'URL correspond a un mapping detecte
         if (urlMappings.containsKey(url)) {
             resp.getWriter().print("URL trouvee : " + url + " -> " + urlMappings.get(url));
         } else {
@@ -114,5 +124,4 @@ public class FrontServlet extends HttpServlet {
                     + "\nMappings disponibles : " + urlMappings.toString());
         }
     }
-
 }
