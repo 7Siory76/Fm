@@ -4,7 +4,6 @@ import jakarta.servlet.*;
 import jakarta.servlet.http.*;
 import java.io.File;
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.net.URL;
@@ -15,14 +14,16 @@ import java.util.Map;
 
 import servlet.annotations.Controller;
 import servlet.annotations.GetMapping;
+import servlet.annotations.Json;
 import servlet.annotations.PostMapping;
 import servlet.annotations.RequestMapping;
 import servlet.annotations.RequestParam;
 import servlet.annotations.Url;
+import servlet.util.JsonUtils;
+import servlet.util.ObjectBinder;
 
 public class FrontServlet extends HttpServlet {
 
-    // Classe interne pour stocker le mapping complet
     private static class Mapping {
         Class<?> controllerClass;
         Method method;
@@ -33,7 +34,6 @@ public class FrontServlet extends HttpServlet {
         }
     }
 
-    // Stockage : "url|HTTPMETHOD" -> Mapping  (ex: "/etudiant|GET", "/etudiant|*")
     private HashMap<String, Mapping> urlMappings = new HashMap<>();
 
     @Override
@@ -43,40 +43,33 @@ public class FrontServlet extends HttpServlet {
 
             for (Class<?> clazz : controllers) {
                 for (Method method : clazz.getDeclaredMethods()) {
-                    // @GetMapping
                     if (method.isAnnotationPresent(GetMapping.class)) {
                         String url = method.getAnnotation(GetMapping.class).value();
                         urlMappings.put(url + "|GET", new Mapping(clazz, method));
                     }
-                    // @PostMapping
                     if (method.isAnnotationPresent(PostMapping.class)) {
                         String url = method.getAnnotation(PostMapping.class).value();
                         urlMappings.put(url + "|POST", new Mapping(clazz, method));
                     }
-                    // @RequestMapping (toutes methodes HTTP)
                     if (method.isAnnotationPresent(RequestMapping.class)) {
                         String url = method.getAnnotation(RequestMapping.class).value();
                         urlMappings.put(url + "|*", new Mapping(clazz, method));
                     }
-                    // @Url (backward compat -> toutes methodes)
                     if (method.isAnnotationPresent(Url.class)) {
                         String url = method.getAnnotation(Url.class).value();
                         urlMappings.put(url + "|*", new Mapping(clazz, method));
                     }
                 }
             }
-
         } catch (Exception e) {
             throw new ServletException(e);
         }
     }
 
-    // Scanner tout le classpath pour trouver les classes annotees @Controller
     private List<Class<?>> scanControllers() throws Exception {
         List<Class<?>> controllers = new ArrayList<>();
         ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
 
-        // Parcourir toutes les racines du classpath
         java.util.Enumeration<URL> roots = classLoader.getResources("");
         while (roots.hasMoreElements()) {
             URL root = roots.nextElement();
@@ -93,7 +86,6 @@ public class FrontServlet extends HttpServlet {
         return controllers;
     }
 
-    // Trouver recursivement toutes les classes dans un repertoire
     private List<Class<?>> findClasses(File root, File current) {
         List<Class<?>> classes = new ArrayList<>();
         if (!current.exists()) return classes;
@@ -113,7 +105,6 @@ public class FrontServlet extends HttpServlet {
                     Class<?> clazz = Class.forName(className);
                     classes.add(clazz);
                 } catch (ClassNotFoundException | NoClassDefFoundError e) {
-                    // Ignorer les classes non chargeables
                 }
             }
         }
@@ -127,11 +118,9 @@ public class FrontServlet extends HttpServlet {
         String path = req.getRequestURI();
         ServletContext context = getServletContext();
 
-        // Recuperer le chemin relatif au contexte
         String servletPath = req.getServletPath();
         String realPath = context.getRealPath(servletPath);
 
-        // Si c'est un fichier physique, deleguer au servlet par defaut de Tomcat
         if (realPath != null) {
             java.io.File file = new java.io.File(realPath);
             if (file.exists() && file.isFile()) {
@@ -141,28 +130,17 @@ public class FrontServlet extends HttpServlet {
             }
         }
 
-        // Extraire l'URL relative (sans le context path)
         String contextPath = req.getContextPath();
         String url = path.substring(contextPath.length());
         String httpMethod = req.getMethod().toUpperCase();
 
-        // Chercher le mapping par priorite :
-        // 1. exact url|METHOD (ex: /etudiant|GET)
-        // 2. exact url|* (ex: /etudiant|*)
-        // 3. pattern url avec {param}|METHOD
-        // 4. pattern url avec {param}|*
-        Mapping mapping = null;
+        Mapping mapping = urlMappings.get(url + "|" + httpMethod);
         HashMap<String, String> pathVariables = new HashMap<>();
 
-        // 1. Exact match avec methode HTTP
-        mapping = urlMappings.get(url + "|" + httpMethod);
-
-        // 2. Exact match wildcard
         if (mapping == null) {
             mapping = urlMappings.get(url + "|*");
         }
 
-        // 3 & 4. Pattern matching
         if (mapping == null) {
             for (String key : urlMappings.keySet()) {
                 int sep = key.lastIndexOf("|");
@@ -174,7 +152,6 @@ public class FrontServlet extends HttpServlet {
                 HashMap<String, String> vars = matchUrlPattern(pattern, url);
                 if (vars != null) {
                     if (keyMethod.equals(httpMethod) || keyMethod.equals("*")) {
-                        // Preferer l'exact methode sur le wildcard
                         if (keyMethod.equals(httpMethod)) {
                             mapping = urlMappings.get(key);
                             pathVariables = vars;
@@ -193,30 +170,28 @@ public class FrontServlet extends HttpServlet {
             resp.getWriter().print("Aucun mapping trouve pour : " + httpMethod + " " + url);
             return;
         }
+
+        boolean isJsonResponse = mapping.method.isAnnotationPresent(Json.class)
+                || mapping.controllerClass.isAnnotationPresent(Json.class);
+
         try {
-            // Instancier le controller
             Object controllerInstance = mapping.controllerClass.getDeclaredConstructor().newInstance();
 
-            // Preparer les arguments de la methode a partir des parametres de la request
             Method method = mapping.method;
             Parameter[] params = method.getParameters();
             Object[] args = new Object[params.length];
 
             for (int i = 0; i < params.length; i++) {
-                // Determiner le nom du parametre a chercher
                 String paramName;
                 if (params[i].isAnnotationPresent(RequestParam.class)) {
-                    // @RequestParam("nom") -> chercher ce nom
                     paramName = params[i].getAnnotation(RequestParam.class).value();
                 } else {
-                    // Sinon utiliser le nom du parametre Java
                     paramName = params[i].getName();
                 }
 
                 Class<?> paramType = params[i].getType();
-                String paramValue = null;
 
-                // Si le type est Map -> injecter tous les parametres de la request
+                // 1. Map
                 if (Map.class.isAssignableFrom(paramType)) {
                     HashMap<String, Object> allParams = new HashMap<>();
                     java.util.Enumeration<String> names = req.getParameterNames();
@@ -224,59 +199,85 @@ public class FrontServlet extends HttpServlet {
                         String name = names.nextElement();
                         allParams.put(name, req.getParameter(name));
                     }
-                    // Ajouter aussi les path variables
                     allParams.putAll(pathVariables);
                     args[i] = allParams;
                     continue;
                 }
 
-                // 1. Chercher dans les path variables ({id} dans l'URL)
-                if (pathVariables.containsKey(paramName)) {
-                    paramValue = pathVariables.get(paramName);
-                }
-                // 2. Sinon chercher dans les query params (req.getParameter)
-                if (paramValue == null) {
-                    paramValue = req.getParameter(paramName);
+                // 2. Types simples (String, int, Integer, boolean, Double, etc.)
+                if (isSimpleType(paramType)) {
+                    String paramValue = null;
+                    if (pathVariables.containsKey(paramName)) {
+                        paramValue = pathVariables.get(paramName);
+                    }
+                    if (paramValue == null) {
+                        paramValue = req.getParameter(paramName);
+                    }
+
+                    if (paramValue != null) {
+                        args[i] = ObjectBinder.convertParam(paramValue, paramType);
+                    } else {
+                        args[i] = ObjectBinder.getDefaultPrimitive(paramType);
+                    }
+                    continue;
                 }
 
-                if (paramValue != null) {
-                    args[i] = convertParam(paramValue, paramType);
-                } else {
-                    if (paramType.isPrimitive()) {
-                        args[i] = getDefaultPrimitive(paramType);
+                // 3. Tableaux
+                if (paramType.isArray()) {
+                    Class<?> compType = paramType.getComponentType();
+                    if (isSimpleType(compType)) {
+                        String[] values = req.getParameterValues(paramName);
+                        if (values != null) {
+                            Object arr = java.lang.reflect.Array.newInstance(compType, values.length);
+                            for (int k = 0; k < values.length; k++) {
+                                java.lang.reflect.Array.set(arr, k, ObjectBinder.convertParam(values[k], compType));
+                            }
+                            args[i] = arr;
+                        } else {
+                            args[i] = java.lang.reflect.Array.newInstance(compType, 0);
+                        }
                     } else {
-                        args[i] = null;
+                        // Tableau d'objets (ex: Employee[] es)
+                        args[i] = ObjectBinder.bindArray(compType, paramName, req);
                     }
+                    continue;
                 }
+
+                // 4. Objet complexe (ex: Employee e, Etudiant etudiant)
+                args[i] = ObjectBinder.bindObject(paramType, paramName, req);
             }
 
             // Invoquer la methode avec les arguments
             Object result = method.invoke(controllerInstance, args);
 
-            // Verifier le type de retour
+            // Sprint 9 : Reponse API REST (JSON)
+            if (isJsonResponse) {
+                resp.setContentType("application/json; charset=UTF-8");
+                String jsonStr = JsonUtils.formatApiResponse(result, 200, "success");
+                resp.getWriter().print(jsonStr);
+                return;
+            }
+
+            // Reponse classique (String / ModelView)
             Class<?> returnType = mapping.method.getReturnType();
 
             if (returnType == String.class && result != null) {
                 String strResult = (String) result;
 
                 if (strResult.endsWith(".jsp")) {
-                    // Si le retour est un chemin JSP, forward vers la JSP
                     req.setAttribute("url", url);
                     RequestDispatcher rd = req.getRequestDispatcher(strResult);
                     rd.forward(req, resp);
                 } else {
-                    // Sinon, afficher le String directement
                     resp.setContentType("text/plain; charset=UTF-8");
                     resp.getWriter().print(strResult);
                 }
             } else if (returnType == ModelView.class && result != null) {
-                // Retour ModelView -> forward vers la vue
                 ModelView mv = (ModelView) result;
                 String view = mv.getView();
 
                 if (view != null && !view.isEmpty()) {
                     req.setAttribute("url", url);
-                    // Transferer toutes les donnees du ModelView en attributs de la request
                     HashMap<String, Object> data = mv.getData();
                     for (String key : data.keySet()) {
                         req.setAttribute(key, data.get(key));
@@ -289,7 +290,6 @@ public class FrontServlet extends HttpServlet {
                     resp.getWriter().print("Erreur : ModelView retourne avec une vue null ou vide.");
                 }
             } else {
-                // Type de retour non supporte
                 resp.setContentType("text/plain; charset=UTF-8");
                 resp.setStatus(500);
                 resp.getWriter().print("Erreur : le type de retour '"
@@ -300,16 +300,30 @@ public class FrontServlet extends HttpServlet {
             }
 
         } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (isJsonResponse) {
+                resp.setContentType("application/json; charset=UTF-8");
+                resp.setStatus(500);
+                try {
+                    resp.getWriter().print(JsonUtils.formatApiError(500, cause.getMessage()));
+                } catch (IOException ignored) {}
+                return;
+            }
             throw new ServletException("Erreur lors de l'invocation de "
                     + mapping.controllerClass.getName() + "#" + mapping.method.getName(), e);
         }
     }
 
-    // Matcher une URL avec un pattern contenant {param}
-    // Ex: pattern="/etudiant/{id}", url="/etudiant/5" -> {"id": "5"}
-    // Retourne null si pas de match
+    private boolean isSimpleType(Class<?> type) {
+        return type == String.class || type.isPrimitive() ||
+               type == Integer.class || type == Long.class ||
+               type == Double.class || type == Float.class ||
+               type == Boolean.class || type == Short.class ||
+               type == Byte.class || type == Character.class ||
+               type.isEnum();
+    }
+
     private HashMap<String, String> matchUrlPattern(String pattern, String url) {
-        // Pas de placeholder -> pas de pattern matching
         if (!pattern.contains("{")) return null;
 
         String[] patternParts = pattern.split("/");
@@ -321,45 +335,12 @@ public class FrontServlet extends HttpServlet {
 
         for (int i = 0; i < patternParts.length; i++) {
             if (patternParts[i].startsWith("{") && patternParts[i].endsWith("}")) {
-                // C'est un placeholder -> extraire le nom et la valeur
                 String varName = patternParts[i].substring(1, patternParts[i].length() - 1);
                 variables.put(varName, urlParts[i]);
             } else if (!patternParts[i].equals(urlParts[i])) {
-                // Segment fixe qui ne correspond pas
                 return null;
             }
         }
         return variables;
-    }
-
-    // Convertir une valeur String en le type attendu
-    private Object convertParam(String value, Class<?> type) {
-        if (type == String.class) {
-            return value;
-        } else if (type == int.class || type == Integer.class) {
-            return Integer.parseInt(value);
-        } else if (type == long.class || type == Long.class) {
-            return Long.parseLong(value);
-        } else if (type == double.class || type == Double.class) {
-            return Double.parseDouble(value);
-        } else if (type == float.class || type == Float.class) {
-            return Float.parseFloat(value);
-        } else if (type == boolean.class || type == Boolean.class) {
-            return Boolean.parseBoolean(value);
-        }
-        return value;
-    }
-
-    // Valeur par defaut pour les types primitifs
-    private Object getDefaultPrimitive(Class<?> type) {
-        if (type == int.class) return 0;
-        if (type == long.class) return 0L;
-        if (type == double.class) return 0.0;
-        if (type == float.class) return 0.0f;
-        if (type == boolean.class) return false;
-        if (type == char.class) return '\0';
-        if (type == byte.class) return (byte) 0;
-        if (type == short.class) return (short) 0;
-        return null;
     }
 }
