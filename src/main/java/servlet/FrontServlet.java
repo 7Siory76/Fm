@@ -6,6 +6,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -132,9 +133,33 @@ public class FrontServlet extends HttpServlet {
 
         Mapping mapping = urlMappings.get(url);
         try {
-            // Instancier le controller et invoquer la methode
+            // Instancier le controller
             Object controllerInstance = mapping.controllerClass.getDeclaredConstructor().newInstance();
-            Object result = mapping.method.invoke(controllerInstance);
+
+            // Preparer les arguments de la methode a partir des parametres de la request
+            Method method = mapping.method;
+            Parameter[] params = method.getParameters();
+            Object[] args = new Object[params.length];
+
+            for (int i = 0; i < params.length; i++) {
+                String paramName = params[i].getName();
+                String paramValue = req.getParameter(paramName);
+                Class<?> paramType = params[i].getType();
+
+                if (paramValue != null) {
+                    args[i] = convertParam(paramValue, paramType);
+                } else {
+                    // Pas de valeur -> null pour les objets, valeur par defaut pour les primitifs
+                    if (paramType.isPrimitive()) {
+                        args[i] = getDefaultPrimitive(paramType);
+                    } else {
+                        args[i] = null;
+                    }
+                }
+            }
+
+            // Invoquer la methode avec les arguments
+            Object result = method.invoke(controllerInstance, args);
 
             // Verifier le type de retour
             Class<?> returnType = mapping.method.getReturnType();
@@ -186,5 +211,36 @@ public class FrontServlet extends HttpServlet {
             throw new ServletException("Erreur lors de l'invocation de "
                     + mapping.controllerClass.getName() + "#" + mapping.method.getName(), e);
         }
+    }
+
+    // Convertir une valeur String en le type attendu
+    private Object convertParam(String value, Class<?> type) {
+        if (type == String.class) {
+            return value;
+        } else if (type == int.class || type == Integer.class) {
+            return Integer.parseInt(value);
+        } else if (type == long.class || type == Long.class) {
+            return Long.parseLong(value);
+        } else if (type == double.class || type == Double.class) {
+            return Double.parseDouble(value);
+        } else if (type == float.class || type == Float.class) {
+            return Float.parseFloat(value);
+        } else if (type == boolean.class || type == Boolean.class) {
+            return Boolean.parseBoolean(value);
+        }
+        return value;
+    }
+
+    // Valeur par defaut pour les types primitifs
+    private Object getDefaultPrimitive(Class<?> type) {
+        if (type == int.class) return 0;
+        if (type == long.class) return 0L;
+        if (type == double.class) return 0.0;
+        if (type == float.class) return 0.0f;
+        if (type == boolean.class) return false;
+        if (type == char.class) return '\0';
+        if (type == byte.class) return (byte) 0;
+        if (type == short.class) return (short) 0;
+        return null;
     }
 }
