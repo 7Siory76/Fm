@@ -144,12 +144,27 @@ public class FrontServlet extends HttpServlet {
 
                 if (strResult.endsWith(".jsp")) {
                     // Si le retour est un chemin JSP, forward vers la JSP
+                    req.setAttribute("url", url);
                     RequestDispatcher rd = req.getRequestDispatcher(strResult);
                     rd.forward(req, resp);
                 } else {
                     // Sinon, afficher le String directement
                     resp.setContentType("text/plain; charset=UTF-8");
                     resp.getWriter().print(strResult);
+                }
+            } else if (returnType == ModelView.class && result != null) {
+                // Retour ModelView -> forward vers la vue
+                ModelView mv = (ModelView) result;
+                String view = mv.getView();
+
+                if (view != null && !view.isEmpty()) {
+                    req.setAttribute("url", url);
+                    RequestDispatcher rd = req.getRequestDispatcher(view);
+                    rd.forward(req, resp);
+                } else {
+                    resp.setContentType("text/plain; charset=UTF-8");
+                    resp.setStatus(500);
+                    resp.getWriter().print("Erreur : ModelView retourne avec une vue null ou vide.");
                 }
             } else {
                 // Type de retour non supporte
@@ -159,7 +174,7 @@ public class FrontServlet extends HttpServlet {
                         + returnType.getName()
                         + "' de la methode "
                         + mapping.controllerClass.getName() + "#" + mapping.method.getName()
-                        + " n'est pas supporte. Seuls String et String(.jsp) sont acceptes.");
+                        + " n'est pas supporte. Seuls String, String(.jsp) et ModelView sont acceptes.");
             }
 
         } catch (Exception e) {
