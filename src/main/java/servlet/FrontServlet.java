@@ -4,6 +4,7 @@ import jakarta.servlet.*;
 import jakarta.servlet.http.*;
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.ArrayList;
@@ -15,23 +16,31 @@ import servlet.annotations.Url;
 
 public class FrontServlet extends HttpServlet {
 
-    // Stockage : url -> "ClassName#methodName"
-    private HashMap<String, String> urlMappings = new HashMap<>();
+    // Classe interne pour stocker le mapping complet
+    private static class Mapping {
+        Class<?> controllerClass;
+        Method method;
+
+        Mapping(Class<?> controllerClass, Method method) {
+            this.controllerClass = controllerClass;
+            this.method = method;
+        }
+    }
+
+    // Stockage : url -> Mapping (classe + methode)
+    private HashMap<String, Mapping> urlMappings = new HashMap<>();
 
     @Override
     public void init() throws ServletException {
         try {
-            // Scanner tout le classpath pour trouver les @Controller
             List<Class<?>> controllers = scanControllers();
 
-            // Pour chaque @Controller, chercher les methodes @Url
             for (Class<?> clazz : controllers) {
                 for (Method method : clazz.getDeclaredMethods()) {
                     if (method.isAnnotationPresent(Url.class)) {
                         Url urlAnnotation = method.getAnnotation(Url.class);
                         String url = urlAnnotation.value();
-                        String mapping = clazz.getName() + "#" + method.getName();
-                        urlMappings.put(url, mapping);
+                        urlMappings.put(url, new Mapping(clazz, method));
                     }
                 }
             }
@@ -115,13 +124,47 @@ public class FrontServlet extends HttpServlet {
         String contextPath = req.getContextPath();
         String url = path.substring(contextPath.length());
 
-        resp.setContentType("text/plain");
+        if (!urlMappings.containsKey(url)) {
+            resp.setContentType("text/plain");
+            resp.getWriter().print("Aucun mapping trouve pour : " + url);
+            return;
+        }
 
-        if (urlMappings.containsKey(url)) {
-            resp.getWriter().print("URL trouvee : " + url + " -> " + urlMappings.get(url));
-        } else {
-            resp.getWriter().print("Aucun mapping trouve pour : " + url
-                    + "\nMappings disponibles : " + urlMappings.toString());
+        Mapping mapping = urlMappings.get(url);
+        try {
+            // Instancier le controller et invoquer la methode
+            Object controllerInstance = mapping.controllerClass.getDeclaredConstructor().newInstance();
+            Object result = mapping.method.invoke(controllerInstance);
+
+            // Verifier le type de retour
+            Class<?> returnType = mapping.method.getReturnType();
+
+            if (returnType == String.class && result != null) {
+                String strResult = (String) result;
+
+                if (strResult.endsWith(".jsp")) {
+                    // Si le retour est un chemin JSP, forward vers la JSP
+                    RequestDispatcher rd = req.getRequestDispatcher(strResult);
+                    rd.forward(req, resp);
+                } else {
+                    // Sinon, afficher le String directement
+                    resp.setContentType("text/plain; charset=UTF-8");
+                    resp.getWriter().print(strResult);
+                }
+            } else {
+                // Type de retour non supporte
+                resp.setContentType("text/plain; charset=UTF-8");
+                resp.setStatus(500);
+                resp.getWriter().print("Erreur : le type de retour '"
+                        + returnType.getName()
+                        + "' de la methode "
+                        + mapping.controllerClass.getName() + "#" + mapping.method.getName()
+                        + " n'est pas supporte. Seuls String et String(.jsp) sont acceptes.");
+            }
+
+        } catch (Exception e) {
+            throw new ServletException("Erreur lors de l'invocation de "
+                    + mapping.controllerClass.getName() + "#" + mapping.method.getName(), e);
         }
     }
 }
