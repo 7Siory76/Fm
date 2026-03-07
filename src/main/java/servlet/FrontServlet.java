@@ -159,6 +159,11 @@ public class FrontServlet extends HttpServlet {
 
                 if (view != null && !view.isEmpty()) {
                     req.setAttribute("url", url);
+                    // Transferer toutes les donnees du ModelView en attributs de la request
+                    HashMap<String, Object> data = mv.getData();
+                    for (String key : data.keySet()) {
+                        req.setAttribute(key, data.get(key));
+                    }
                     RequestDispatcher rd = req.getRequestDispatcher(view);
                     rd.forward(req, resp);
                 } else {
