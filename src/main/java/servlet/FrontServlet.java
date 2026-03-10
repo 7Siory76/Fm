@@ -11,6 +11,7 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import servlet.annotations.Controller;
 import servlet.annotations.GetMapping;
@@ -214,6 +215,20 @@ public class FrontServlet extends HttpServlet {
 
                 Class<?> paramType = params[i].getType();
                 String paramValue = null;
+
+                // Si le type est Map -> injecter tous les parametres de la request
+                if (Map.class.isAssignableFrom(paramType)) {
+                    HashMap<String, Object> allParams = new HashMap<>();
+                    java.util.Enumeration<String> names = req.getParameterNames();
+                    while (names.hasMoreElements()) {
+                        String name = names.nextElement();
+                        allParams.put(name, req.getParameter(name));
+                    }
+                    // Ajouter aussi les path variables
+                    allParams.putAll(pathVariables);
+                    args[i] = allParams;
+                    continue;
+                }
 
                 // 1. Chercher dans les path variables ({id} dans l'URL)
                 if (pathVariables.containsKey(paramName)) {
