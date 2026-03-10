@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 
 import servlet.annotations.Controller;
+import servlet.annotations.RequestParam;
 import servlet.annotations.Url;
 
 public class FrontServlet extends HttpServlet {
@@ -125,13 +126,27 @@ public class FrontServlet extends HttpServlet {
         String contextPath = req.getContextPath();
         String url = path.substring(contextPath.length());
 
-        if (!urlMappings.containsKey(url)) {
+        // Chercher le mapping : d'abord exact, sinon par pattern avec {param}
+        Mapping mapping = urlMappings.get(url);
+        HashMap<String, String> pathVariables = new HashMap<>();
+
+        if (mapping == null) {
+            // Essayer de matcher avec les patterns contenant {param}
+            for (String pattern : urlMappings.keySet()) {
+                HashMap<String, String> vars = matchUrlPattern(pattern, url);
+                if (vars != null) {
+                    mapping = urlMappings.get(pattern);
+                    pathVariables = vars;
+                    break;
+                }
+            }
+        }
+
+        if (mapping == null) {
             resp.setContentType("text/plain");
             resp.getWriter().print("Aucun mapping trouve pour : " + url);
             return;
         }
-
-        Mapping mapping = urlMappings.get(url);
         try {
             // Instancier le controller
             Object controllerInstance = mapping.controllerClass.getDeclaredConstructor().newInstance();
@@ -142,14 +157,31 @@ public class FrontServlet extends HttpServlet {
             Object[] args = new Object[params.length];
 
             for (int i = 0; i < params.length; i++) {
-                String paramName = params[i].getName();
-                String paramValue = req.getParameter(paramName);
+                // Determiner le nom du parametre a chercher
+                String paramName;
+                if (params[i].isAnnotationPresent(RequestParam.class)) {
+                    // @RequestParam("nom") -> chercher ce nom
+                    paramName = params[i].getAnnotation(RequestParam.class).value();
+                } else {
+                    // Sinon utiliser le nom du parametre Java
+                    paramName = params[i].getName();
+                }
+
                 Class<?> paramType = params[i].getType();
+                String paramValue = null;
+
+                // 1. Chercher dans les path variables ({id} dans l'URL)
+                if (pathVariables.containsKey(paramName)) {
+                    paramValue = pathVariables.get(paramName);
+                }
+                // 2. Sinon chercher dans les query params (req.getParameter)
+                if (paramValue == null) {
+                    paramValue = req.getParameter(paramName);
+                }
 
                 if (paramValue != null) {
                     args[i] = convertParam(paramValue, paramType);
                 } else {
-                    // Pas de valeur -> null pour les objets, valeur par defaut pour les primitifs
                     if (paramType.isPrimitive()) {
                         args[i] = getDefaultPrimitive(paramType);
                     } else {
@@ -211,6 +243,33 @@ public class FrontServlet extends HttpServlet {
             throw new ServletException("Erreur lors de l'invocation de "
                     + mapping.controllerClass.getName() + "#" + mapping.method.getName(), e);
         }
+    }
+
+    // Matcher une URL avec un pattern contenant {param}
+    // Ex: pattern="/etudiant/{id}", url="/etudiant/5" -> {"id": "5"}
+    // Retourne null si pas de match
+    private HashMap<String, String> matchUrlPattern(String pattern, String url) {
+        // Pas de placeholder -> pas de pattern matching
+        if (!pattern.contains("{")) return null;
+
+        String[] patternParts = pattern.split("/");
+        String[] urlParts = url.split("/");
+
+        if (patternParts.length != urlParts.length) return null;
+
+        HashMap<String, String> variables = new HashMap<>();
+
+        for (int i = 0; i < patternParts.length; i++) {
+            if (patternParts[i].startsWith("{") && patternParts[i].endsWith("}")) {
+                // C'est un placeholder -> extraire le nom et la valeur
+                String varName = patternParts[i].substring(1, patternParts[i].length() - 1);
+                variables.put(varName, urlParts[i]);
+            } else if (!patternParts[i].equals(urlParts[i])) {
+                // Segment fixe qui ne correspond pas
+                return null;
+            }
+        }
+        return variables;
     }
 
     // Convertir une valeur String en le type attendu
