@@ -13,6 +13,9 @@ import java.util.HashMap;
 import java.util.List;
 
 import servlet.annotations.Controller;
+import servlet.annotations.GetMapping;
+import servlet.annotations.PostMapping;
+import servlet.annotations.RequestMapping;
 import servlet.annotations.RequestParam;
 import servlet.annotations.Url;
 
@@ -29,7 +32,7 @@ public class FrontServlet extends HttpServlet {
         }
     }
 
-    // Stockage : url -> Mapping (classe + methode)
+    // Stockage : "url|HTTPMETHOD" -> Mapping  (ex: "/etudiant|GET", "/etudiant|*")
     private HashMap<String, Mapping> urlMappings = new HashMap<>();
 
     @Override
@@ -39,10 +42,25 @@ public class FrontServlet extends HttpServlet {
 
             for (Class<?> clazz : controllers) {
                 for (Method method : clazz.getDeclaredMethods()) {
+                    // @GetMapping
+                    if (method.isAnnotationPresent(GetMapping.class)) {
+                        String url = method.getAnnotation(GetMapping.class).value();
+                        urlMappings.put(url + "|GET", new Mapping(clazz, method));
+                    }
+                    // @PostMapping
+                    if (method.isAnnotationPresent(PostMapping.class)) {
+                        String url = method.getAnnotation(PostMapping.class).value();
+                        urlMappings.put(url + "|POST", new Mapping(clazz, method));
+                    }
+                    // @RequestMapping (toutes methodes HTTP)
+                    if (method.isAnnotationPresent(RequestMapping.class)) {
+                        String url = method.getAnnotation(RequestMapping.class).value();
+                        urlMappings.put(url + "|*", new Mapping(clazz, method));
+                    }
+                    // @Url (backward compat -> toutes methodes)
                     if (method.isAnnotationPresent(Url.class)) {
-                        Url urlAnnotation = method.getAnnotation(Url.class);
-                        String url = urlAnnotation.value();
-                        urlMappings.put(url, new Mapping(clazz, method));
+                        String url = method.getAnnotation(Url.class).value();
+                        urlMappings.put(url + "|*", new Mapping(clazz, method));
                     }
                 }
             }
@@ -125,26 +143,53 @@ public class FrontServlet extends HttpServlet {
         // Extraire l'URL relative (sans le context path)
         String contextPath = req.getContextPath();
         String url = path.substring(contextPath.length());
+        String httpMethod = req.getMethod().toUpperCase();
 
-        // Chercher le mapping : d'abord exact, sinon par pattern avec {param}
-        Mapping mapping = urlMappings.get(url);
+        // Chercher le mapping par priorite :
+        // 1. exact url|METHOD (ex: /etudiant|GET)
+        // 2. exact url|* (ex: /etudiant|*)
+        // 3. pattern url avec {param}|METHOD
+        // 4. pattern url avec {param}|*
+        Mapping mapping = null;
         HashMap<String, String> pathVariables = new HashMap<>();
 
+        // 1. Exact match avec methode HTTP
+        mapping = urlMappings.get(url + "|" + httpMethod);
+
+        // 2. Exact match wildcard
         if (mapping == null) {
-            // Essayer de matcher avec les patterns contenant {param}
-            for (String pattern : urlMappings.keySet()) {
+            mapping = urlMappings.get(url + "|*");
+        }
+
+        // 3 & 4. Pattern matching
+        if (mapping == null) {
+            for (String key : urlMappings.keySet()) {
+                int sep = key.lastIndexOf("|");
+                String pattern = key.substring(0, sep);
+                String keyMethod = key.substring(sep + 1);
+
+                if (!pattern.contains("{")) continue;
+
                 HashMap<String, String> vars = matchUrlPattern(pattern, url);
                 if (vars != null) {
-                    mapping = urlMappings.get(pattern);
-                    pathVariables = vars;
-                    break;
+                    if (keyMethod.equals(httpMethod) || keyMethod.equals("*")) {
+                        // Preferer l'exact methode sur le wildcard
+                        if (keyMethod.equals(httpMethod)) {
+                            mapping = urlMappings.get(key);
+                            pathVariables = vars;
+                            break;
+                        } else if (mapping == null) {
+                            mapping = urlMappings.get(key);
+                            pathVariables = vars;
+                        }
+                    }
                 }
             }
         }
 
         if (mapping == null) {
             resp.setContentType("text/plain");
-            resp.getWriter().print("Aucun mapping trouve pour : " + url);
+            resp.getWriter().print("Aucun mapping trouve pour : " + httpMethod + " " + url);
             return;
         }
         try {
