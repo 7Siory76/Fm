@@ -5,13 +5,11 @@ import jakarta.servlet.annotation.MultipartConfig;
 import jakarta.servlet.http.*;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import servlet.annotations.Controller;
 import servlet.annotations.GetMapping;
@@ -19,10 +17,15 @@ import servlet.annotations.Json;
 import servlet.annotations.PostMapping;
 import servlet.annotations.RequestMapping;
 import servlet.annotations.RequestParam;
+import servlet.annotations.Authorized;
+import servlet.annotations.Role;
+import servlet.annotations.Session;
 import servlet.annotations.Url;
+import servlet.security.UserSession;
 import servlet.util.FileUploadUtils;
 import servlet.util.JsonUtils;
 import servlet.util.ObjectBinder;
+import servlet.util.SessionMap;
 
 @MultipartConfig
 public class FrontServlet extends HttpServlet {
@@ -38,9 +41,14 @@ public class FrontServlet extends HttpServlet {
     }
 
     private HashMap<String, Mapping> urlMappings = new HashMap<>();
+    private String authSessionKey = "auth";
+    private String roleSessionKey = "role";
 
     @Override
     public void init() throws ServletException {
+        // Charger la configuration des cles de session depuis app.properties ou init-params
+        loadSecurityConfig();
+
         try {
             List<Class<?>> controllers = scanControllers();
 
@@ -66,6 +74,32 @@ public class FrontServlet extends HttpServlet {
             }
         } catch (Exception e) {
             throw new ServletException(e);
+        }
+    }
+
+    private void loadSecurityConfig() {
+        // 1. Essayer de lire depuis app.properties
+        try (InputStream input = Thread.currentThread().getContextClassLoader().getResourceAsStream("app.properties")) {
+            if (input != null) {
+                Properties prop = new Properties();
+                prop.load(input);
+                if (prop.containsKey("auth.session.key")) {
+                    authSessionKey = prop.getProperty("auth.session.key").trim();
+                }
+                if (prop.containsKey("role.session.key")) {
+                    roleSessionKey = prop.getProperty("role.session.key").trim();
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 2. Override possible via web.xml (Servlet init-param)
+        String webXmlAuthKey = getInitParameter("auth.session.key");
+        if (webXmlAuthKey != null && !webXmlAuthKey.trim().isEmpty()) {
+            authSessionKey = webXmlAuthKey.trim();
+        }
+        String webXmlRoleKey = getInitParameter("role.session.key");
+        if (webXmlRoleKey != null && !webXmlRoleKey.trim().isEmpty()) {
+            roleSessionKey = webXmlRoleKey.trim();
         }
     }
 
@@ -177,6 +211,43 @@ public class FrontServlet extends HttpServlet {
         boolean isJsonResponse = mapping.method.isAnnotationPresent(Json.class)
                 || mapping.controllerClass.isAnnotationPresent(Json.class);
 
+        // -----------------------------------------------------------------
+        // VERIFICATION DE SECURITE (@Authorized, @Role)
+        // -----------------------------------------------------------------
+        boolean isAuthorizedAnnotated = mapping.method.isAnnotationPresent(Authorized.class)
+                || mapping.controllerClass.isAnnotationPresent(Authorized.class);
+
+        boolean isRoleAnnotated = mapping.method.isAnnotationPresent(Role.class)
+                || mapping.controllerClass.isAnnotationPresent(Role.class);
+
+        if (isAuthorizedAnnotated || isRoleAnnotated) {
+            HttpSession currentSession = req.getSession(false);
+            Object authValue = (currentSession != null) ? currentSession.getAttribute(authSessionKey) : null;
+
+            // 1. Verification de l'authentification
+            if (authValue == null || (authValue instanceof Boolean && !((Boolean) authValue))) {
+                sendErrorResponse(resp, 403, "Accès refusé : Vous devez être authentifié pour accéder à cette ressource.", isJsonResponse);
+                return;
+            }
+
+            // 2. Verification du role (si @Role est presente)
+            if (isRoleAnnotated) {
+                String[] requiredRoles;
+                if (mapping.method.isAnnotationPresent(Role.class)) {
+                    requiredRoles = mapping.method.getAnnotation(Role.class).value();
+                } else {
+                    requiredRoles = mapping.controllerClass.getAnnotation(Role.class).value();
+                }
+
+                Object roleValue = (currentSession != null) ? currentSession.getAttribute(roleSessionKey) : null;
+
+                if (!hasRequiredRole(requiredRoles, roleValue, authValue)) {
+                    sendErrorResponse(resp, 403, "Accès refusé : Rôle insuffisant pour exécuter cette action.", isJsonResponse);
+                    return;
+                }
+            }
+        }
+
         try {
             Object controllerInstance = mapping.controllerClass.getDeclaredConstructor().newInstance();
 
@@ -184,7 +255,7 @@ public class FrontServlet extends HttpServlet {
             Parameter[] params = method.getParameters();
             Object[] args = new Object[params.length];
 
-            // Traitement des fichiers uploades
+            // Traitement des fichiers uploades s'il s'agit d'une requete multipart
             Map<String, List<Upload>> uploadsMap = FileUploadUtils.parseUploads(req, method, mapping.controllerClass);
 
             for (int i = 0; i < params.length; i++) {
@@ -196,8 +267,30 @@ public class FrontServlet extends HttpServlet {
                 }
 
                 Class<?> paramType = params[i].getType();
+                boolean isSessionAnnotated = params[i].isAnnotationPresent(Session.class);
 
-                // 1. Map (Map<String, List<Upload>> ou Map<String, Object>)
+                // A. Injection de MySession ou HttpSession
+                if (paramType == MySession.class) {
+                    args[i] = new MySession(req.getSession(true));
+                    continue;
+                }
+
+                if (paramType == HttpSession.class) {
+                    args[i] = req.getSession(true);
+                    continue;
+                }
+
+                // B. Injection avec @Session Map<String, Object> ou Map annoté @Session
+                if (isSessionAnnotated) {
+                    if (paramType == MySession.class) {
+                        args[i] = new MySession(req.getSession(true));
+                    } else if (Map.class.isAssignableFrom(paramType)) {
+                        args[i] = new SessionMap(req.getSession(true));
+                    }
+                    continue;
+                }
+
+                // C. Uploads et Maps classiques
                 if (Map.class.isAssignableFrom(paramType)) {
                     if (!uploadsMap.isEmpty()) {
                         args[i] = uploadsMap;
@@ -214,7 +307,7 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 2. Objet Upload individuel
+                // D. Fichiers Upload
                 if (paramType == Upload.class) {
                     if (uploadsMap.containsKey(paramName) && !uploadsMap.get(paramName).isEmpty()) {
                         args[i] = uploadsMap.get(paramName).get(0);
@@ -226,7 +319,6 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 3. Tableau Upload[]
                 if (paramType == Upload[].class) {
                     if (uploadsMap.containsKey(paramName)) {
                         List<Upload> list = uploadsMap.get(paramName);
@@ -243,7 +335,6 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 4. Liste List<Upload> ou List
                 if (List.class.isAssignableFrom(paramType)) {
                     if (uploadsMap.containsKey(paramName)) {
                         args[i] = uploadsMap.get(paramName);
@@ -259,7 +350,7 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 5. Types simples (String, int, Integer, boolean, Double, etc.)
+                // E. Types simples (String, int, Integer, boolean, Double, etc.)
                 if (isSimpleType(paramType)) {
                     String paramValue = null;
                     if (pathVariables.containsKey(paramName)) {
@@ -277,7 +368,7 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 6. Tableaux de primitives/Strings
+                // F. Tableaux de primitives/Strings
                 if (paramType.isArray()) {
                     Class<?> compType = paramType.getComponentType();
                     if (isSimpleType(compType)) {
@@ -292,13 +383,12 @@ public class FrontServlet extends HttpServlet {
                             args[i] = java.lang.reflect.Array.newInstance(compType, 0);
                         }
                     } else {
-                        // Tableau d'objets (ex: Employee[] es)
                         args[i] = ObjectBinder.bindArray(compType, paramName, req);
                     }
                     continue;
                 }
 
-                // 7. Objet complexe (ex: Employee e, Etudiant etudiant)
+                // G. Objet complexe (ex: Employee e, Etudiant etudiant)
                 args[i] = ObjectBinder.bindObject(paramType, paramName, req);
             }
 
@@ -366,6 +456,65 @@ public class FrontServlet extends HttpServlet {
             }
             throw new ServletException("Erreur lors de l'invocation de "
                     + mapping.controllerClass.getName() + "#" + mapping.method.getName(), e);
+        }
+    }
+
+    private boolean hasRequiredRole(String[] requiredRoles, Object roleValue, Object authValue) {
+        if (requiredRoles == null || requiredRoles.length == 0) return true;
+
+        // 1. Verifier si authValue ou roleValue est une instance de UserSession
+        if (authValue instanceof UserSession) {
+            UserSession userSession = (UserSession) authValue;
+            for (String role : requiredRoles) {
+                if (userSession.hasRole(role)) return true;
+            }
+        }
+        if (roleValue instanceof UserSession) {
+            UserSession userSession = (UserSession) roleValue;
+            for (String role : requiredRoles) {
+                if (userSession.hasRole(role)) return true;
+            }
+        }
+
+        // 2. Verifier si roleValue est un String
+        if (roleValue instanceof String) {
+            String roleStr = (String) roleValue;
+            for (String reqRole : requiredRoles) {
+                if (reqRole.equalsIgnoreCase(roleStr)) return true;
+            }
+        }
+
+        // 3. Verifier si roleValue est un String[]
+        if (roleValue instanceof String[]) {
+            String[] rolesArr = (String[]) roleValue;
+            for (String reqRole : requiredRoles) {
+                for (String userRole : rolesArr) {
+                    if (reqRole.equalsIgnoreCase(userRole)) return true;
+                }
+            }
+        }
+
+        // 4. Verifier si roleValue est une Collection (List / Set)
+        if (roleValue instanceof Collection) {
+            Collection<?> col = (Collection<?>) roleValue;
+            for (String reqRole : requiredRoles) {
+                for (Object item : col) {
+                    if (item != null && reqRole.equalsIgnoreCase(item.toString())) return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void sendErrorResponse(HttpServletResponse resp, int statusCode, String message, boolean isJson) throws IOException {
+        resp.setStatus(statusCode);
+        if (isJson) {
+            resp.setContentType("application/json; charset=UTF-8");
+            resp.getWriter().print(JsonUtils.formatApiError(statusCode, message));
+        } else {
+            resp.setContentType("text/html; charset=UTF-8");
+            resp.getWriter().print("<div style='color:red; font-family:sans-serif; margin:30px; border:1px solid red; padding:20px; border-radius:8px;'><h2>Erreur " + statusCode + "</h2><p>" + message + "</p></div>");
         }
     }
 
