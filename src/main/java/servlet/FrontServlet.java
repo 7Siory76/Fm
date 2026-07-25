@@ -1,6 +1,7 @@
 package servlet;
 
 import jakarta.servlet.*;
+import jakarta.servlet.annotation.MultipartConfig;
 import jakarta.servlet.http.*;
 import java.io.File;
 import java.io.IOException;
@@ -19,9 +20,11 @@ import servlet.annotations.PostMapping;
 import servlet.annotations.RequestMapping;
 import servlet.annotations.RequestParam;
 import servlet.annotations.Url;
+import servlet.util.FileUploadUtils;
 import servlet.util.JsonUtils;
 import servlet.util.ObjectBinder;
 
+@MultipartConfig
 public class FrontServlet extends HttpServlet {
 
     private static class Mapping {
@@ -181,6 +184,9 @@ public class FrontServlet extends HttpServlet {
             Parameter[] params = method.getParameters();
             Object[] args = new Object[params.length];
 
+            // Traitement des fichiers uploades
+            Map<String, List<Upload>> uploadsMap = FileUploadUtils.parseUploads(req, method, mapping.controllerClass);
+
             for (int i = 0; i < params.length; i++) {
                 String paramName;
                 if (params[i].isAnnotationPresent(RequestParam.class)) {
@@ -191,20 +197,69 @@ public class FrontServlet extends HttpServlet {
 
                 Class<?> paramType = params[i].getType();
 
-                // 1. Map
+                // 1. Map (Map<String, List<Upload>> ou Map<String, Object>)
                 if (Map.class.isAssignableFrom(paramType)) {
-                    HashMap<String, Object> allParams = new HashMap<>();
-                    java.util.Enumeration<String> names = req.getParameterNames();
-                    while (names.hasMoreElements()) {
-                        String name = names.nextElement();
-                        allParams.put(name, req.getParameter(name));
+                    if (!uploadsMap.isEmpty()) {
+                        args[i] = uploadsMap;
+                    } else {
+                        HashMap<String, Object> allParams = new HashMap<>();
+                        java.util.Enumeration<String> names = req.getParameterNames();
+                        while (names.hasMoreElements()) {
+                            String name = names.nextElement();
+                            allParams.put(name, req.getParameter(name));
+                        }
+                        allParams.putAll(pathVariables);
+                        args[i] = allParams;
                     }
-                    allParams.putAll(pathVariables);
-                    args[i] = allParams;
                     continue;
                 }
 
-                // 2. Types simples (String, int, Integer, boolean, Double, etc.)
+                // 2. Objet Upload individuel
+                if (paramType == Upload.class) {
+                    if (uploadsMap.containsKey(paramName) && !uploadsMap.get(paramName).isEmpty()) {
+                        args[i] = uploadsMap.get(paramName).get(0);
+                    } else if (uploadsMap.size() == 1) {
+                        args[i] = uploadsMap.values().iterator().next().get(0);
+                    } else {
+                        args[i] = null;
+                    }
+                    continue;
+                }
+
+                // 3. Tableau Upload[]
+                if (paramType == Upload[].class) {
+                    if (uploadsMap.containsKey(paramName)) {
+                        List<Upload> list = uploadsMap.get(paramName);
+                        args[i] = list.toArray(new Upload[0]);
+                    } else if (!uploadsMap.isEmpty()) {
+                        List<Upload> allUploads = new ArrayList<>();
+                        for (List<Upload> uList : uploadsMap.values()) {
+                            allUploads.addAll(uList);
+                        }
+                        args[i] = allUploads.toArray(new Upload[0]);
+                    } else {
+                        args[i] = new Upload[0];
+                    }
+                    continue;
+                }
+
+                // 4. Liste List<Upload> ou List
+                if (List.class.isAssignableFrom(paramType)) {
+                    if (uploadsMap.containsKey(paramName)) {
+                        args[i] = uploadsMap.get(paramName);
+                    } else if (!uploadsMap.isEmpty()) {
+                        List<Upload> allUploads = new ArrayList<>();
+                        for (List<Upload> uList : uploadsMap.values()) {
+                            allUploads.addAll(uList);
+                        }
+                        args[i] = allUploads;
+                    } else {
+                        args[i] = new ArrayList<>();
+                    }
+                    continue;
+                }
+
+                // 5. Types simples (String, int, Integer, boolean, Double, etc.)
                 if (isSimpleType(paramType)) {
                     String paramValue = null;
                     if (pathVariables.containsKey(paramName)) {
@@ -222,7 +277,7 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 3. Tableaux
+                // 6. Tableaux de primitives/Strings
                 if (paramType.isArray()) {
                     Class<?> compType = paramType.getComponentType();
                     if (isSimpleType(compType)) {
@@ -243,14 +298,14 @@ public class FrontServlet extends HttpServlet {
                     continue;
                 }
 
-                // 4. Objet complexe (ex: Employee e, Etudiant etudiant)
+                // 7. Objet complexe (ex: Employee e, Etudiant etudiant)
                 args[i] = ObjectBinder.bindObject(paramType, paramName, req);
             }
 
             // Invoquer la methode avec les arguments
             Object result = method.invoke(controllerInstance, args);
 
-            // Sprint 9 : Reponse API REST (JSON)
+            // Reponse API REST (JSON)
             if (isJsonResponse) {
                 resp.setContentType("application/json; charset=UTF-8");
                 String jsonStr = JsonUtils.formatApiResponse(result, 200, "success");
